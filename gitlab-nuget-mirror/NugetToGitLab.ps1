@@ -1,14 +1,16 @@
 [CmdletBinding()]
 param(
   [switch]$WhatIf,
-  [switch]$IgnorePushedPackagesTxtRef
+  [switch]$IgnorePushedPackagesTxtRef,
+  [string]$RepositoryPath,
+  [string]$SolutionPath,
+  [ValidateNotNullOrWhiteSpace()][string]$GitLabSourceName = "gitlab-nuget"
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $GitLabFeedIndexUrl = "https://gitlab.airparsiana.com/api/v4/projects/35/packages/nuget/index.json"
-$GitLabSourceName = "gitlab-airparsiana-nuget"
 $NuGetOrgFeedIndexUrl = "https://api.nuget.org/v3/index.json"
 $SkipSeedingPackagePattern = "AP.*"
 $PushTimeoutSeconds = 1800
@@ -79,7 +81,12 @@ function Write-LogSeparator {
 function Find-RepoRoot {
   param([Parameter(Mandatory = $true)][string]$StartPath)
 
-  $current = (Resolve-Path $StartPath).Path
+  $resolvedStartPath = (Resolve-Path $StartPath).Path
+  $current = if (Test-Path -Path $resolvedStartPath -PathType Leaf) {
+    Split-Path -Parent $resolvedStartPath
+  } else {
+    $resolvedStartPath
+  }
 
   while ($true) {
     if (Test-Path (Join-Path $current ".git")) {
@@ -342,7 +349,11 @@ function Get-PackagesFromAssets {
 function Get-DownloadSourcesForPackageId {
   param([Parameter(Mandatory = $true)][string]$PackageId)
 
-  return @($NuGetOrgFeedIndexUrl)
+  if ($PackageId -like $SkipSeedingPackagePattern) {
+    return @($GitLabFeedIndexUrl)
+  }
+
+  return @($NuGetOrgFeedIndexUrl, $GitLabFeedIndexUrl)
 }
 
 function Get-LooseNuGetVersionKey {
@@ -417,8 +428,7 @@ function Get-PackageReferenceKey {
 }
 
 function New-PackageReferenceSet {
-  $set = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-  return ,$set
+  return @{}
 }
 
 function Load-PushedPackagesReference {
@@ -426,17 +436,17 @@ function Load-PushedPackagesReference {
 
   $set = New-PackageReferenceSet
   if (-not (Test-Path $Path)) {
-    return ,$set
+    return $set
   }
 
   foreach ($line in Get-Content -Path $Path) {
     $trimmed = $line.Trim()
     if (-not [string]::IsNullOrWhiteSpace($trimmed)) {
-      [void]$set.Add($trimmed)
+      $set[$trimmed] = $true
     }
   }
 
-  return ,$set
+  return $set
 }
 
 function Save-PushedPackagesReference {
@@ -450,7 +460,7 @@ function Save-PushedPackagesReference {
     Ensure-Directory -Path $directory
   }
 
-  $values = @($Set | Sort-Object)
+  $values = @($Set.Keys | Sort-Object)
   Set-Content -Path $Path -Value $values -Encoding UTF8
 }
 
@@ -592,7 +602,7 @@ function Push-Packages {
           Write-Log ("Pushed: {0} {1}" -f $package.Id, $package.Version) "SUCCESS"
         }
 
-        [void]$PushedPackagesSet.Add($packageRefKey)
+        $PushedPackagesSet[$packageRefKey] = $true
         $isDone = $true
         continue
       }
@@ -600,7 +610,7 @@ function Push-Packages {
       if ($lastOutputText -match "already exists|duplicate|409|Conflict") {
         $skipped++
         Write-Log ("Skip push (duplicate with non-zero exit): {0} {1}" -f $package.Id, $package.Version) "WARN"
-        [void]$PushedPackagesSet.Add($packageRefKey)
+        $PushedPackagesSet[$packageRefKey] = $true
         $isDone = $true
         continue
       }
@@ -609,7 +619,7 @@ function Push-Packages {
       if ($outputIndicatesSuccessfulPush) {
         $pushed++
         Write-Log ("Pushed (confirmed by output): {0} {1}" -f $package.Id, $package.Version) "SUCCESS"
-        [void]$PushedPackagesSet.Add($packageRefKey)
+        $PushedPackagesSet[$packageRefKey] = $true
         $isDone = $true
         continue
       }
@@ -706,6 +716,13 @@ function Invoke-NuGetSeeding {
   Write-Log ("Cache path: {0}" -f $CacheDir)
   Write-Log ("WhatIf mode: {0}" -f $WhatIf.IsPresent)
   Write-Log ("IgnorePushedPackagesTxtRef mode: {0}" -f $IgnorePushedPackagesTxtRef.IsPresent)
+  Write-Log ("GitLab source alias: {0}" -f $GitLabSourceName)
+  if (-not [string]::IsNullOrWhiteSpace($RepositoryPath)) {
+    Write-Log ("RepositoryPath override: {0}" -f $RepositoryPath)
+  }
+  if (-not [string]::IsNullOrWhiteSpace($SolutionPath)) {
+    Write-Log ("SolutionPath override: {0}" -f $SolutionPath)
+  }
 
   Ensure-Command -Name "dotnet"
   $nugetExe = Resolve-NuGetExe
@@ -713,8 +730,28 @@ function Invoke-NuGetSeeding {
   $gitLabUser = Get-RequiredEnvVar -Name "GITLAB_NUGET_USER"
   $gitLabToken = Get-RequiredEnvVar -Name "GITLAB_NUGET_TOKEN"
 
-  $repoRoot = Find-RepoRoot -StartPath $ScriptDir
-  $solutionPath = Select-Solution -RepoRoot $repoRoot
+  $repoStartPath = if (-not [string]::IsNullOrWhiteSpace($RepositoryPath)) {
+    $RepositoryPath
+  } else {
+    (Get-Location).Path
+  }
+
+  $repoRoot = Find-RepoRoot -StartPath $repoStartPath
+
+  $solutionPath = if (-not [string]::IsNullOrWhiteSpace($SolutionPath)) {
+    if (-not (Test-Path -Path $SolutionPath -PathType Leaf)) {
+      throw "Provided SolutionPath does not exist: '$SolutionPath'."
+    }
+
+    $resolvedSolutionPath = (Resolve-Path $SolutionPath).Path
+    if ([System.IO.Path]::GetExtension($resolvedSolutionPath) -ne ".sln") {
+      throw "Provided SolutionPath must point to a .sln file: '$resolvedSolutionPath'."
+    }
+
+    $resolvedSolutionPath
+  } else {
+    Select-Solution -RepoRoot $repoRoot
+  }
   $projectPaths = @(Get-ProjectsFromSln -SolutionPath $solutionPath)
 
   if ($projectPaths.Count -eq 0) {
@@ -765,7 +802,7 @@ function Invoke-NuGetSeeding {
     }
 
     $packageRefKey = Get-PackageReferenceKey -PackageId $package.Id -Version $package.Version
-    if ((-not $IgnorePushedPackagesTxtRef.IsPresent) -and $pushedPackagesReference.Contains($packageRefKey)) {
+    if ((-not $IgnorePushedPackagesTxtRef.IsPresent) -and $pushedPackagesReference.ContainsKey($packageRefKey)) {
       $Summary.ReferenceSkipped++
       Write-Log ("Skip by pushed-packages reference: {0} {1}" -f $package.Id, $package.Version) "INFO"
       continue

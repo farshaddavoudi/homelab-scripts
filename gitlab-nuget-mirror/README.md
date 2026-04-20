@@ -1,59 +1,42 @@
-# GitLab NuGet Mirror Script
+# GitLab NuGet Mirror (AirParsiana)
 
-This folder contains one Windows PowerShell script to seed/mirror NuGet packages into our internal GitLab NuGet feed.
+`NugetToGitLab.ps1` is the team script for seeding external NuGet packages into the shared GitLab feed used by offline-first CI.
 
-## Script
+## Goal
 
-- `NugetToGitLab.ps1`
+- CI restore/build uses GitLab feed only.
+- `nuget.org` is never used directly in CI.
+- Developers can still work with `nuget.org` locally when needed.
+- Missing packages are mirrored manually via this script.
 
-## Purpose
+## What the script does
 
-- Use GitLab Package Registry (NuGet) as the internal NuGet feed.
-- `nuget.org` must **not** be used as a fallback in CI/offline build flows.
-- When a package is missing in GitLab, run this script (manually or scheduled) to seed it.
+1. Finds the repository root and target solution.
+2. Runs `dotnet restore` with a temporary config (`gitlab` + `nuget.org`) to resolve the full graph.
+3. Reads `obj/project.assets.json` to collect direct + transitive packages.
+4. Skips internal packages matching `AP.*` (expected to already exist in GitLab).
+5. Downloads uncached packages into a shared cache.
+6. Pushes each package to GitLab (`--skip-duplicate`, retry on transient errors).
+7. Saves `pushed-packages.txt` so next runs avoid re-pushing already mirrored versions.
 
-## Platform
+## Prerequisites
 
-- Run this script from **Windows** (PowerShell).
-- It depends on Windows-oriented paths and PowerShell execution behavior.
-
-## Required tooling
-
-- `.NET SDK` (`dotnet` on PATH)
-- `nuget.exe` on PATH (example: `winget install Microsoft.NuGet`)
-
-## Required environment variables
-
-Set these before running the script:
-
-- `GITLAB_NUGET_USER`
-- `GITLAB_NUGET_TOKEN`
+- Windows PowerShell (`powershell.exe`) or PowerShell 7 (`pwsh`).
+- `dotnet` on `PATH`.
+- `nuget.exe` on `PATH`.
+- GitLab credentials in environment variables:
+  - `GITLAB_NUGET_USER`
+  - `GITLAB_NUGET_TOKEN`
 
 Optional:
 
-- `AP_NUGET_SHARED_CACHE` (absolute path for shared cache; default: `C:\Workspace\temp\nuget-shared-cache`)
-
-## Repository NuGet configuration policy
-
-- Keep and use a **repo-level** `NuGet.config`.
-- CI runners should use **only** GitLab feed (no `nuget.org`).
-- Developers on Windows with internet should use:
-  - Default profile/config: only GitLab feed.
-  - Optional profile/config: GitLab + `nuget.org` only when intentionally searching/seeding packages for develop.
-
-## How the script works
-
-1. Detects repository root and selects a solution.
-2. Restores using a temporary config (`gitlab` + `nuget.org`) to resolve package graph.
-3. Reads `project.assets.json` files to discover direct + transitive packages.
-4. Skips internal packages matching `AP.*`.
-5. Downloads missing packages to cache.
-6. Pushes packages to GitLab feed with duplicate-skip and retry logic.
-7. Tracks pushed package references in `pushed-packages.txt` to avoid re-pushing.
+- `AP_NUGET_SHARED_CACHE` absolute path.  
+  Default: `C:\Workspace\temp\nuget-shared-cache`
+- `-GitLabSourceName` script parameter (default: `gitlab-nuget`) if you want a custom local source alias.
 
 ## Usage
 
-From repository root (or any path under repo):
+Default run from the target repository folder:
 
 ```powershell
 pwsh -File .\gitlab-nuget-mirror\NugetToGitLab.ps1
@@ -65,27 +48,54 @@ Dry run:
 pwsh -File .\gitlab-nuget-mirror\NugetToGitLab.ps1 -WhatIf
 ```
 
-Ignore `pushed-packages.txt` reference for one run:
+Ignore `pushed-packages.txt` for one run:
 
 ```powershell
 pwsh -File .\gitlab-nuget-mirror\NugetToGitLab.ps1 -IgnorePushedPackagesTxtRef
 ```
 
-## Scheduled/manual sync recommendation
+Run against a specific repo/solution (when script is outside the repo):
 
-Use a manual run or a Windows scheduled task/job to run this script regularly.
+```powershell
+pwsh -File .\gitlab-nuget-mirror\NugetToGitLab.ps1 `
+  -RepositoryPath C:\Workspace\ap\gitlab-repos\core\services\iam-api `
+  -SolutionPath C:\Workspace\ap\gitlab-repos\core\services\iam-api\AP.Core.IAM.Api.sln
+```
 
-Expected behavior:
+Run with a custom source alias:
 
-- If local dev machine has internet, download required packages and push them to GitLab (skip duplicates/already existing packages).
-- If machine is offline, run is naturally limited/fails for external download stage.
+```powershell
+pwsh -File .\gitlab-nuget-mirror\NugetToGitLab.ps1 -GitLabSourceName gitlab-nuget
+```
 
-## CI / pipeline note
+## Cache and state files
 
-- No pipeline change is required for automatic transfer from `nuget.org` to private GitLab feed.
-- Build/restore fails when a package is missing in GitLab.
-- Missing packages must be seeded by running this script (or waiting for scheduled job).
+Under `<AP_NUGET_SHARED_CACHE>\seed`:
 
-## Operational note
+- `downloads\` : cached `.nupkg` files used for push.
+- `pushed-packages.txt` : package/version references already mirrored.
+- `seed-log.txt` : full run log.
 
-- A valid GitLab token is required to push packages into GitLab feed.
+## CI policy (recommended)
+
+- CI config file (`NuGet.CI.config`) should contain only GitLab feed.
+- Docker/CI restore should explicitly use that file:
+
+```bash
+dotnet restore --configfile ./src/NuGet.CI.config
+```
+
+- Use CI variables for credentials (masked/protected), not hardcoded values.
+
+## Common failure cases
+
+- `401 Unauthorized`: token or username is wrong, missing, expired, or lacks package registry scope.
+- `NU1101 package not found`: package is not mirrored yet; run this script and retry CI.
+- Slow first run: expected when seeding many packages; later runs are faster due to cache + pushed reference.
+- Single package push timeout: rerun script; it retries transient failures and continues other packages.
+
+## Security notes
+
+- Never commit tokens into scripts, Dockerfiles, or config files.
+- Prefer GitLab CI variables and/or deploy tokens for automation.
+- If both GitLab and `nuget.org` are enabled in dev configs, treat internal package names carefully to avoid dependency confusion.
