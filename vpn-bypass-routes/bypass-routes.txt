@@ -3,11 +3,16 @@
 # IP | domain.example.com
 # IP | domain.example.com, www.example.com | optional note
 
+185.120.222.190 | downloadly.ir
 185.143.232.200
 185.143.233.235
 185.166.104.30
 185.166.104.6
 185.188.104.10 | digikala.com
+185.192.112.122 | time.ir
+185.192.112.123 | time.ir
+185.192.112.128 | time.ir
+185.192.114.192 | time.ir
 194.147.142.55
 45.149.76.62 | meet.farshaddavoudi.ir
 5.160.67.12

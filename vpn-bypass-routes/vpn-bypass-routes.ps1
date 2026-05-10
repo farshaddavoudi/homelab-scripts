@@ -65,6 +65,35 @@ function Request-Elevation {
     }
 }
 
+function Ensure-StartupElevation {
+    if (Test-IsAdministrator) {
+        return $false
+    }
+
+    $initialActionArgument = if ([string]::IsNullOrWhiteSpace($InitialAction)) {
+        ""
+    }
+    else {
+        " -InitialAction $InitialAction"
+    }
+
+    $argumentList = "-NoLogo -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"$initialActionArgument"
+
+    try {
+        Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList $argumentList | Out-Null
+        $script:SuppressPauseOnExit = $true
+        return $true
+    }
+    catch {
+        $script:ExitCode = 1
+        Write-Host ""
+        Write-Host "Administrator rights are required for this tool." -ForegroundColor Red
+        Write-Host ("Failed to relaunch as administrator: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+        Pause-Console "Press Enter to close..."
+        return $true
+    }
+}
+
 function Get-RouteListHeaderLines {
     return @(
         "# Format:",
@@ -180,10 +209,9 @@ function Merge-DomainValues {
         [string]$NewDomains
     )
 
-    return Join-DomainTokenList -Tokens @(
-        (Convert-ToDomainTokenList -DomainsText $ExistingDomains) +
-        (Convert-ToDomainTokenList -DomainsText $NewDomains)
-    )
+    $existingTokens = @(Convert-ToDomainTokenList -DomainsText $ExistingDomains)
+    $newTokens = @(Convert-ToDomainTokenList -DomainsText $NewDomains)
+    return Join-DomainTokenList -Tokens @($existingTokens + $newTokens)
 }
 
 function Merge-NoteValues {
@@ -389,6 +417,20 @@ function Get-ManagedIpAddresses {
     return @($Entries | ForEach-Object { $_.IPAddress })
 }
 
+function Get-UniqueIpAddresses {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]]$IpAddresses
+    )
+
+    return @(
+        $IpAddresses |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Sort-Object -Unique
+    )
+}
+
 function Get-ManagedEntryLookup {
     param(
         [Parameter(Mandatory)]
@@ -585,8 +627,17 @@ function Invoke-RouteCommand {
         [switch]$IgnoreExitCode
     )
 
-    $output = & route.exe @Arguments 2>&1
-    $exitCode = $LASTEXITCODE
+    try {
+        $output = & route.exe @Arguments 2>&1
+        $exitCode = $LASTEXITCODE
+    }
+    catch {
+        if ($IgnoreExitCode) {
+            return $_.Exception.Message
+        }
+
+        throw
+    }
 
     if ($exitCode -ne 0 -and -not $IgnoreExitCode) {
         $message = ($output | Out-String).Trim()
@@ -594,6 +645,112 @@ function Invoke-RouteCommand {
     }
 
     return $output
+}
+
+function Remove-PersistentRoutesForIpAddresses {
+    param(
+        [Parameter(Mandatory)]
+        [string[]]$IpAddresses
+    )
+
+    $uniqueIps = @(Get-UniqueIpAddresses -IpAddresses $IpAddresses)
+    foreach ($ipAddress in $uniqueIps) {
+        $destinationPrefix = "$ipAddress/32"
+        $existing = @(Get-NetRoute -AddressFamily IPv4 -PolicyStore PersistentStore -DestinationPrefix $destinationPrefix -ErrorAction SilentlyContinue)
+        if ($existing.Count -eq 0) {
+            continue
+        }
+
+        Invoke-RouteCommand -Arguments @("delete", $ipAddress) -IgnoreExitCode | Out-Null
+    }
+}
+
+function Ensure-PersistentRoutesForIpAddresses {
+    param(
+        [Parameter(Mandatory)]
+        [string[]]$IpAddresses
+    )
+
+    $uniqueIps = @(Get-UniqueIpAddresses -IpAddresses $IpAddresses)
+    if ($uniqueIps.Count -eq 0) {
+        return $null
+    }
+
+    $gateway = Get-DefaultLanRoute
+    foreach ($ipAddress in $uniqueIps) {
+        Remove-PersistentRoutesForIpAddresses -IpAddresses @($ipAddress)
+        Invoke-RouteCommand -Arguments @("-p", "add", $ipAddress, "mask", "255.255.255.255", $gateway.NextHop, "metric", "1") | Out-Null
+    }
+
+    return $gateway
+}
+
+function Sync-ManagedRoutesToWindows {
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$Entries,
+
+        [string[]]$IpAddressesToRemove = @()
+    )
+
+    if (-not (Test-IsAdministrator)) {
+        throw "Administrator rights are required to update Windows routes."
+    }
+
+    $finalIps = @(Get-UniqueIpAddresses -IpAddresses (Get-ManagedIpAddresses -Entries $Entries))
+    $removeIps = @(Get-UniqueIpAddresses -IpAddresses $IpAddressesToRemove)
+
+    if ($removeIps.Count -gt 0) {
+        Remove-PersistentRoutesForIpAddresses -IpAddresses $removeIps
+    }
+
+    $gateway = Ensure-PersistentRoutesForIpAddresses -IpAddresses $finalIps
+
+    return [pscustomobject]@{
+        Gateway = $gateway
+        FinalIPs = $finalIps
+        RemovedIPs = $removeIps
+    }
+}
+
+function Confirm-YesDefaultYes {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Prompt
+    )
+
+    $answer = Read-Host $Prompt
+    if ([string]::IsNullOrWhiteSpace($answer)) {
+        return $true
+    }
+
+    return ($answer -match "^(y|yes)$")
+}
+
+function Show-ManagedRouteApplySummary {
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$Entries,
+
+        [Parameter(Mandatory)]
+        [pscustomobject]$SyncResult
+    )
+
+    Write-Host ""
+    if ($null -ne $SyncResult.Gateway) {
+        Write-Host ("Windows routes updated via gateway {0} ({1})." -f $SyncResult.Gateway.NextHop, $SyncResult.Gateway.InterfaceAlias) -ForegroundColor Green
+    }
+    else {
+        Write-Host "Windows routes updated." -ForegroundColor Green
+    }
+
+    if ($SyncResult.RemovedIPs.Count -gt 0) {
+        Write-Host ("Removed stale persistent routes: {0}" -f ($SyncResult.RemovedIPs -join ", ")) -ForegroundColor Yellow
+    }
+
+    @(Get-ManagedPersistentRouteRows -Entries $Entries) |
+        Format-Table -AutoSize IPAddress, Domains, Note, NextHop, RouteMetric, Store |
+        Out-Host
 }
 
 function Get-SystemDnsARecords {
@@ -786,17 +943,8 @@ function Apply-ManagedRoutes {
         throw "The managed list is empty. Add at least one IP first."
     }
 
-    $gateway = Get-DefaultLanRoute
-    foreach ($entry in $entries) {
-        Invoke-RouteCommand -Arguments @("delete", $entry.IPAddress) -IgnoreExitCode | Out-Null
-        Invoke-RouteCommand -Arguments @("-p", "add", $entry.IPAddress, "mask", "255.255.255.255", $gateway.NextHop, "metric", "1") | Out-Null
-    }
-
-    Write-Host ""
-    Write-Host ("Applied {0} persistent routes to gateway {1} via {2}." -f $entries.Count, $gateway.NextHop, $gateway.InterfaceAlias) -ForegroundColor Green
-    Get-ManagedPersistentRouteRows -Entries $entries |
-        Format-Table -AutoSize IPAddress, Domains, Note, NextHop, RouteMetric, Store |
-        Out-Host
+    $syncResult = Sync-ManagedRoutesToWindows -Entries $entries
+    Show-ManagedRouteApplySummary -Entries $entries -SyncResult $syncResult
 
     return $false
 }
@@ -830,6 +978,7 @@ function Remove-ManagedRoutes {
 function Add-OrUpdateManagedEntries {
     $entries = @(Get-ManagedRouteEntries)
     $entryLookup = Get-ManagedEntryLookup -Entries $entries
+    $existingIps = @(Get-ManagedIpAddresses -Entries $entries)
 
     Write-Host ""
     Write-Host "You can enter one or more IPv4 addresses and optionally attach the same domains/notes to all of them." -ForegroundColor Cyan
@@ -893,9 +1042,16 @@ function Add-OrUpdateManagedEntries {
 
     Write-Host ""
     Write-Host "Saved/updated entries:" -ForegroundColor Green
-    @(Get-ManagedRouteEntries | Where-Object { $ipAddresses -contains $_.IPAddress }) |
+    $savedEntries = @(Get-ManagedRouteEntries)
+    @($savedEntries | Where-Object { $ipAddresses -contains $_.IPAddress }) |
         Format-Table -AutoSize IPAddress, Domains, Note |
         Out-Host
+
+    $newlyAddedIps = @($ipAddresses | Where-Object { $existingIps -notcontains $_ } | Sort-Object -Unique)
+    if ($newlyAddedIps.Count -gt 0 -and (Confirm-YesDefaultYes -Prompt "Apply current managed routes to Windows now? (Y/N, default Y)")) {
+        $syncResult = Sync-ManagedRoutesToWindows -Entries $savedEntries
+        Show-ManagedRouteApplySummary -Entries $savedEntries -SyncResult $syncResult
+    }
 }
 
 function Remove-ManagedIps {
@@ -952,6 +1108,12 @@ function Remove-ManagedIps {
     Write-Host ""
     Write-Host "Removed from managed list:" -ForegroundColor Green
     @($toRemove) | Sort-Object | ForEach-Object { Write-Host "  $_" }
+
+    $savedEntries = @(Get-ManagedRouteEntries)
+    if ((Confirm-YesDefaultYes -Prompt "Remove these routes from Windows and refresh the remaining managed routes now? (Y/N, default Y)")) {
+        $syncResult = Sync-ManagedRoutesToWindows -Entries $savedEntries -IpAddressesToRemove @($toRemove | ForEach-Object { $_ })
+        Show-ManagedRouteApplySummary -Entries $savedEntries -SyncResult $syncResult
+    }
 }
 
 function Show-ManagedPersistentRoutesAction {
@@ -1012,6 +1174,12 @@ function Import-UnmanagedPersistentRoutes {
 
     Save-ManagedRouteEntries -Entries @($mergedEntries | ForEach-Object { $_ })
     Write-Host ("Imported {0} IPs into the managed list." -f $unmanaged.Count) -ForegroundColor Green
+
+    $savedEntries = @(Get-ManagedRouteEntries)
+    if ((Confirm-YesDefaultYes -Prompt "Apply current managed routes to Windows now? (Y/N, default Y)")) {
+        $syncResult = Sync-ManagedRoutesToWindows -Entries $savedEntries
+        Show-ManagedRouteApplySummary -Entries $savedEntries -SyncResult $syncResult
+    }
 }
 
 function Resolve-Ipv4AddressesForDomain {
@@ -1135,9 +1303,13 @@ function Resolve-DomainAndAddEntries {
 
     Write-Host ""
     Write-Host "Saved/updated entries:" -ForegroundColor Green
-    @(Get-ManagedRouteEntries | Where-Object { $resolvedIps -contains $_.IPAddress }) |
+    $savedEntries = @(Get-ManagedRouteEntries)
+    @($savedEntries | Where-Object { $resolvedIps -contains $_.IPAddress }) |
         Format-Table -AutoSize IPAddress, Domains, Note |
         Out-Host
+
+    $syncResult = Sync-ManagedRoutesToWindows -Entries $savedEntries
+    Show-ManagedRouteApplySummary -Entries $savedEntries -SyncResult $syncResult
 }
 
 function Refresh-SavedDomainEntries {
@@ -1219,8 +1391,16 @@ function Refresh-SavedDomainEntries {
 
     Write-Host ""
     Write-Host ("Saved refreshed domain IPs. Domains changed: {0}" -f $changedDomainCount) -ForegroundColor Green
-    if ($changedDomainCount -gt 0) {
-        Write-Host "Run option 2 to refresh the Windows routes for the updated IP list." -ForegroundColor Yellow
+    $originalIps = @(Get-ManagedIpAddresses -Entries $entries)
+    $finalIps = @(Get-ManagedIpAddresses -Entries @($finalEntries | ForEach-Object { $_ }))
+    $staleIps = @($originalIps | Where-Object { $finalIps -notcontains $_ } | Sort-Object -Unique)
+
+    if (Confirm-YesDefaultYes -Prompt "Apply refreshed routes to Windows now? (Y/N, default Y)") {
+        $syncResult = Sync-ManagedRoutesToWindows -Entries @($finalEntries | ForEach-Object { $_ }) -IpAddressesToRemove $staleIps
+        Show-ManagedRouteApplySummary -Entries @($finalEntries | ForEach-Object { $_ }) -SyncResult $syncResult
+    }
+    elseif ($changedDomainCount -gt 0) {
+        Write-Host "Route list updated, but Windows routes were not refreshed yet." -ForegroundColor Yellow
     }
 
     return $false
@@ -1310,6 +1490,9 @@ function Run-InitialAction {
 }
 
 Ensure-RouteListFile
+if (Ensure-StartupElevation) {
+    exit $script:ExitCode
+}
 Run-InitialAction
 
 try {

@@ -37,7 +37,7 @@ This script solves that by:
 - PowerShell
 - Administrator rights when applying or removing routes
 
-You can still open the script and inspect the lists without admin rights. The script only asks for elevation when you choose an action that changes Windows routes.
+The script now requests elevation at startup so the interactive session opens in administrator mode when launched by double-click.
 
 ## Usage
 
@@ -72,7 +72,7 @@ Available actions:
 6. Remove IPs from the managed list.
 7. Show other persistent `/32` routes not in the managed list.
 8. Import those other persistent `/32` routes into the managed list.
-9. Resolve a domain name and add its current IPv4 addresses to the managed list.
+9. Resolve a domain name, add its current IPv4 addresses to the managed list, and apply the Windows routes immediately.
 10. Refresh all saved domain-based entries from current DNS results.
 11. Open `bypass-routes.txt` in Notepad.
 12. Print the equivalent OpenVPN lines using `net_gateway`.
@@ -119,6 +119,7 @@ Important:
 - If a website changes IPs later, the saved route entries can become stale.
 - Menu option `9` is useful when you want to refresh the IP list from the current DNS result.
 - Menu option `9` tries the public resolvers from `dns-resolvers.txt` before it falls back to the current system DNS path.
+- After option `9` saves the resolved IPs, it also updates the Windows persistent routes in the same flow.
 - Menu option `10` re-resolves every saved domain in the list, shows an old-IP/new-IP preview, and then rewrites the domain-based entries if you confirm.
 - If a saved domain cannot be resolved during option `10`, the script keeps its previous IPs instead of dropping the entry.
 
