@@ -1,0 +1,8 @@
+# Public DNS resolver IPv4 addresses used for domain lookup when VPN DNS is problematic.
+# One IPv4 address per line.
+# The script tries these resolvers before system DNS.
+
+1.1.1.1
+8.8.8.8
+9.9.9.9
+208.67.222.222

@@ -1,0 +1,18 @@
+# Format:
+# IP
+# IP | domain.example.com
+# IP | domain.example.com, www.example.com | optional note
+
+185.143.232.200
+185.143.233.235
+185.166.104.30
+185.166.104.6
+185.188.104.10 | digikala.com
+194.147.142.55
+45.149.76.62 | meet.farshaddavoudi.ir
+5.160.67.12
+5.160.67.30
+5.160.67.8
+79.127.127.35 | soft98.ir
+94.182.111.198
+94.182.111.251
